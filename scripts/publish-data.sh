@@ -17,10 +17,20 @@ if [ "$OLD" = "$NEW" ]; then
   exit 0
 fi
 
+PREV="$(git rev-parse --abbrev-ref HEAD)"
+# The orphan checkout tracks these files, so leaving the branch deletes them.
+BACKUP="$(mktemp -d)"; cp plugins.json plugins.digest "$BACKUP"/
+
 git checkout --orphan "data-$(date +%s)" >/dev/null 2>&1
 git rm -rf --cached . >/dev/null
 git add -f plugins.json plugins.digest
 git commit -q -m "catalog ${NEW:0:12}"
 git push --force origin HEAD:data
+
+TEMP="$(git rev-parse --abbrev-ref HEAD)"
+git checkout -f "$PREV" >/dev/null 2>&1
+cp "$BACKUP/plugins.json" "$BACKUP/plugins.digest" .
+rm -rf "$BACKUP"
+git branch -D "$TEMP" >/dev/null 2>&1 || true
 
 echo "published digest ${NEW:0:12}"
