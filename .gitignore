@@ -3,3 +3,8 @@ plugins.digest
 crawl.log
 node_modules/
 gh-login.log
+full.log
+test400.log
+run.log
+run-failed.log
+publish.log

@@ -14,7 +14,6 @@ import { readFile, writeFile } from "node:fs/promises";
 import { categoriesFor } from "./categories.mjs";
 
 const REGISTRY = "https://registry.npmjs.org";
-const DOWNLOADS = "https://api.npmjs.org/downloads/point";
 const GH_GRAPHQL = "https://api.github.com/graphql";
 
 const PAGE_SIZE = 250;
@@ -25,11 +24,10 @@ const QUERIES = [
   "keywords:opencode-tui",
   "keywords:opencode-theme",
 ];
-const META_CONCURRENCY = 5;
-const SCOPED_CONCURRENCY = 3;
+const META_CONCURRENCY = 8; // concurrency only fills the pipe; MIN_GAP_MS governs the real rate
+const MIN_GAP_MS = 70; // ~14 req/s global: the registry 429s on bursts and sends no Retry-After
 const SEARCH_GAP_MS = 600; // the search endpoint 429s on bursts; no Retry-After header
 const GH_BATCH = 50;
-const DOWNLOAD_BATCH = 50; // API allows 128, but URL length gets long
 const TIMEOUT_MS = 15_000;
 const RETRIES = 4;
 const ABBR = "application/vnd.npm.install-v1+json";
@@ -41,17 +39,41 @@ const SELF_TEST = argv.includes("--self-test");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// One shared gate for the whole run: per-request retries alone turn a 429 burst
+// into a retry storm that keeps the endpoint hot. Pausing everyone is cheaper.
+const throttle = { next: 0, pausedUntil: 0, hits429: 0 };
+async function gate(gap = MIN_GAP_MS) {
+  for (;;) {
+    const now = Date.now();
+    const at = Math.max(throttle.next, throttle.pausedUntil);
+    if (now >= at) {
+      throttle.next = now + gap;
+      return;
+    }
+    await sleep(at - now);
+  }
+}
+
 async function getJson(url, { headers = {}, timeout = TIMEOUT_MS } = {}) {
   let lastErr;
   for (let attempt = 0; attempt <= RETRIES; attempt++) {
     try {
+      await gate();
       const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeout) });
-      if (res.status === 429 || res.status >= 500) throw new Error(`HTTP ${res.status} ${url}`);
+      if (res.status === 429) {
+        throttle.hits429++;
+        throttle.pausedUntil = Date.now() + 2_500 + Math.random() * 1_500;
+        throw new Error(`HTTP 429 ${url}`);
+      }
+      if (res.status >= 500) throw new Error(`HTTP ${res.status} ${url}`);
       if (!res.ok) return null; // 404 and friends are not fatal per item
       return await res.json();
     } catch (err) {
       lastErr = err;
-      if (attempt < RETRIES) await sleep(1_500 * 2 ** attempt + Math.random() * 500);
+      // 429 already paused the whole run; extra per-request sleep would only stretch it.
+      if (attempt < RETRIES && !String(err.message).startsWith("HTTP 429")) {
+        await sleep(800 * 2 ** attempt + Math.random() * 400);
+      }
     }
   }
   throw lastErr;
@@ -139,40 +161,12 @@ async function metaFor(name) {
 const CORE_NAMES = new Set(["opencode", "opencode-ai", "opencode-web", "opencode-docs"]);
 const isOfficialCore = (name) => CORE_NAMES.has(name) || /^@opencode(-ai)?\//.test(name);
 
-// ---------------------------------------------------------------- downloads
-
-async function downloadsFor(names) {
-  const out = new Map();
-  const put = (name, period, count) => {
-    const entry = out.get(name) ?? {};
-    if (period === "last-month") entry.month = count;
-    else entry.week = count;
-    out.set(name, entry);
-  };
-
-  const unscoped = names.filter((n) => !n.startsWith("@"));
-  for (let i = 0; i < unscoped.length; i += DOWNLOAD_BATCH) {
-    const chunk = unscoped.slice(i, i + DOWNLOAD_BATCH);
-    for (const period of ["last-month", "last-week"]) {
-      const data = await getJson(`${DOWNLOADS}/${period}/${chunk.join(",")}`).catch(() => null);
-      for (const [key, value] of Object.entries(data ?? {})) {
-        if (value && typeof value.downloads === "number") put(key, period, value.downloads);
-      }
-    }
-  }
-
-  // Scoped packages are rejected by the bulk endpoint.
-  const scoped = names.filter((n) => n.startsWith("@"));
-  await pool(scoped, SCOPED_CONCURRENCY, async (name) => {
-    for (const period of ["last-month", "last-week"]) {
-      const data = await getJson(`${DOWNLOADS}/${period}/${name}`).catch(() => null);
-      if (data && typeof data.downloads === "number") put(name, period, data.downloads);
-    }
-    return null;
-  });
-
-  return out;
-}
+// A real plugin declares opencode-plugin, or opencode+plugin, or depends on a
+// plugin API package. Multi-harness tools that just mention opencode fail all three.
+const isPlugin = (keywords, compat) =>
+  keywords.includes("opencode-plugin") ||
+  (keywords.includes("opencode") && keywords.includes("plugin")) ||
+  compat !== "unknown";
 
 // ---------------------------------------------------------------- github
 
@@ -289,7 +283,15 @@ async function crawl() {
   if (LIMIT) candidates = candidates.slice(0, LIMIT);
 
   console.log("metadata…");
-  const metas = await pool(candidates, META_CONCURRENCY, (o) => metaFor(o.package.name));
+  const t0 = Date.now();
+  let done = 0;
+  const metas = await pool(candidates, META_CONCURRENCY, async (o) => {
+    const result = await metaFor(o.package.name);
+    if (++done % 100 === 0) {
+      console.log(`  ${done}/${candidates.length} ${((Date.now() - t0) / 1000).toFixed(0)}s (429s: ${throttle.hits429})`);
+    }
+    return result;
+  });
   const metaByName = new Map();
   candidates.forEach((o, i) => {
     if (metas[i]) metaByName.set(o.package.name, metas[i]);
@@ -303,9 +305,6 @@ async function crawl() {
     process.exit(1);
   }
 
-  console.log("downloads…");
-  const downloadMap = await downloadsFor([...metaByName.keys()]);
-
   console.log("github…");
   const slugs = new Set();
   let overrides = {};
@@ -316,14 +315,11 @@ async function crawl() {
   }
 
   const plugins = [];
+  let excluded = 0;
   for (const object of candidates) {
     const name = object.package.name;
     const meta = metaByName.get(name);
     if (!meta) continue;
-
-    const searchRepo = repoSlugFromUrl(object.package.links?.repository);
-    const slug = searchRepo ?? null;
-    if (slug) slugs.add(slug);
 
     // Drop only what is provably not a plugin: the official core packages.
     if (isOfficialCore(name) && meta.compat === "unknown") {
@@ -331,13 +327,27 @@ async function crawl() {
       continue;
     }
 
-    const downloads = downloadMap.get(name) ?? {};
+    // Filter before the github phase so excluded packages cost no GraphQL quota.
+    const kws = (object.package.keywords ?? []).map((k) => String(k).toLowerCase());
+    if (!isPlugin(kws, meta.compat)) {
+      if (process.env.DEBUG_DROPS) console.log(`  drop ${name} (not a plugin)`);
+      excluded++;
+      continue;
+    }
+
+    const searchRepo = repoSlugFromUrl(object.package.links?.repository);
+    const slug = searchRepo ?? null;
+    if (slug) slugs.add(slug);
+
+    // Search already carries npm's own download counts, for scoped packages too.
+    const downloads = object.downloads ?? {};
     const pkg = object.package;
     plugins.push({
       slug: slugFor(name),
       name,
       title: pkg.name,
       version: meta.latest ?? pkg.version ?? "",
+      compat: meta.compat,
       description: pkg.description ?? "",
       keywords: (pkg.keywords ?? []).slice(0, 20),
       topics: [],
@@ -347,10 +357,12 @@ async function crawl() {
       homepage: pkg.links?.homepage ?? undefined,
       repoUrl: pkg.links?.repository ?? undefined,
       owner: slug ? slug.split("/")[0] : undefined,
-      downloadsMonth: downloads.month ?? 0,
-      downloadsWeek: downloads.week ?? 0,
+      downloadsMonth: downloads.monthly ?? 0,
+      downloadsWeek: downloads.weekly ?? 0,
     });
   }
+
+  console.log(`excluded: ${excluded} non-plugins (kept ${plugins.length})`);
 
   console.log(`github: ${slugs.size} repos`);
   const slugList = [...slugs];

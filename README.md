@@ -29,9 +29,8 @@ Escribe `plugins.json` + `plugins.digest` (sha256 del array de plugins, sin el t
 
 ## Fuentes
 
-- **npm search** (`registry.npmjs.org/-/v1/search`) — 4 queries, máximo 20 páginas de 250 por query.
+- **npm search** (`registry.npmjs.org/-/v1/search`) — 4 queries, máximo 20 páginas de 250 por query. Cada resultado ya trae `downloads.monthly` / `downloads.weekly`, así que **no se consulta la API de estadísticas**.
 - **npm metadata** — `application/vnd.npm.install-v1+json` (2,4–3,6× más chica que el packument completo).
-- **npm downloads** (`api.npmjs.org/downloads/point`) — lotes de 50 sin scope; uno por paquete con scope.
 - **GitHub GraphQL** — stars, forks, archived, `pushedAt`, topics. 50 repos por query con alias.
 
 ### Límites que condicionan el diseño
