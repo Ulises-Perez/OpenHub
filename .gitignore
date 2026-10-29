@@ -1,0 +1,5 @@
+﻿plugins.json
+plugins.digest
+crawl.log
+node_modules/
+gh-login.log

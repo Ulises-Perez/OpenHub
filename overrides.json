@@ -1,0 +1,4 @@
+{
+  "_comment": "Manual category fixes, applied before the keyword mapping. slug -> category.",
+  "_example": { "some-author--some-plugin": "mcp" }
+}

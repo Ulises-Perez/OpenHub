@@ -1,0 +1,44 @@
+name: crawl
+
+on:
+  schedule:
+    - cron: "23 4 * * *"   # UTC, off the hour: scheduled runs get delayed at :00
+  workflow_dispatch:
+  push:
+    paths:
+      - "crawl.mjs"
+      - "categories.mjs"
+      - "overrides.json"
+      - ".github/workflows/crawl.yml"
+
+permissions:
+  contents: write
+
+# Without a group two runs can overlap and each force-push; one silently wins.
+concurrency:
+  group: crawl
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # amend needs a parent
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: self test
+        run: node crawl.mjs --self-test
+
+      - name: crawl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node crawl.mjs
+
+      - name: publish
+        run: bash scripts/publish-data.sh
